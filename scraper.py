@@ -2,21 +2,52 @@
 """
 Scrapes con-nect.de/wennigsen and writes an RSS feed to feed.xml.
 Only articles from the last 7 days are included.
-For each recent article the full text is fetched from the detail page.
+
+Full article text is fetched from the detail page exactly once per article
+and cached locally in cache.json. Entries expire automatically after 7 days.
 """
 import urllib.request
 import re
 import datetime
 import os
+import json
 from email.utils import formatdate
 import calendar
 import sys
 
-SOURCE_URL = "https://www.con-nect.de/wennigsen"
+SOURCE_URL  = "https://www.con-nect.de/wennigsen"
 BASE_URL    = "https://www.con-nect.de"
-OUTPUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feed.xml")
+DIR         = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_FILE = os.path.join(DIR, "feed.xml")
+CACHE_FILE  = os.path.join(DIR, "cache.json")
 DAYS_BACK   = 7
 
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+def load_cache():
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    return {}
+
+
+def save_cache(cache):
+    with open(CACHE_FILE, "w", encoding="utf-8") as fh:
+        json.dump(cache, fh, ensure_ascii=False, indent=2)
+
+
+def expire_cache(cache):
+    """Remove entries older than DAYS_BACK days."""
+    cutoff = (datetime.datetime.now() - datetime.timedelta(days=DAYS_BACK)).strftime("%Y-%m-%d")
+    return {url: data for url, data in cache.items() if data.get("date", "") >= cutoff}
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
 
 def fetch(url):
     req = urllib.request.Request(
@@ -56,6 +87,10 @@ def fetch_full_text(url):
         return ""
 
 
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
 def parse_articles(html):
     articles = []
 
@@ -66,7 +101,6 @@ def parse_articles(html):
     )
 
     for block in blocks:
-        # --- date ---
         date_m = re.search(r'<time[^>]+datetime="(\d{4}-\d{2}-\d{2})"', block)
         if not date_m:
             date_m = re.search(r'<time[^>]*>\s*(\d{2}\.\d{2}\.\d{4})\s*</time>', block)
@@ -82,7 +116,6 @@ def parse_articles(html):
             except ValueError:
                 continue
 
-        # --- link + title ---
         link_m = re.search(
             r'<a[^>]+href="(/wennigsen/[^"]+)"[^>]*>.*?'
             r'<span[^>]*itemprop="headline"[^>]*>(.*?)</span>',
@@ -105,6 +138,10 @@ def filter_recent(articles):
     cutoff = datetime.datetime.now() - datetime.timedelta(days=DAYS_BACK)
     return [a for a in articles if a["date"] >= cutoff]
 
+
+# ---------------------------------------------------------------------------
+# RSS builder
+# ---------------------------------------------------------------------------
 
 def xml_escape(s):
     return (
@@ -149,25 +186,41 @@ def build_rss(articles):
     )
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     try:
+        cache   = load_cache()
+        cache   = expire_cache(cache)
+
         html     = fetch(SOURCE_URL)
         articles = parse_articles(html)
         recent   = filter_recent(articles)
 
-        # Fetch full text only for recent articles (minimises HTTP requests)
+        fetched = 0
         for a in recent:
-            a["desc"] = fetch_full_text(a["link"])
-            print(f"  [{a['date'].strftime('%d.%m.%Y')}] {a['title'][:60]}")
+            url = a["link"]
+            if url in cache:
+                a["desc"] = cache[url]["desc"]
+                print(f"  [cache] [{a['date'].strftime('%d.%m.%Y')}] {a['title'][:55]}")
+            else:
+                a["desc"] = fetch_full_text(url)
+                cache[url] = {"date": a["date"].strftime("%Y-%m-%d"), "desc": a["desc"]}
+                fetched += 1
+                print(f"  [neu]   [{a['date'].strftime('%d.%m.%Y')}] {a['title'][:55]}")
+
+        save_cache(cache)
 
         rss = build_rss(recent)
-
         with open(OUTPUT_FILE, "w", encoding="utf-8") as fh:
             fh.write(rss)
 
         print(
             f"[{datetime.datetime.now():%Y-%m-%d %H:%M}] "
-            f"OK – {len(recent)} Artikel in feed.xml geschrieben"
+            f"OK – {len(recent)} Artikel ({fetched} neu abgerufen, "
+            f"{len(recent) - fetched} aus Cache)"
         )
     except Exception as exc:
         print(f"[{datetime.datetime.now():%Y-%m-%d %H:%M}] FEHLER: {exc}", file=sys.stderr)
