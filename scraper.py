@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Scrapes con-nect.de/wennigsen and writes an RSS feed to feed.xml.
-Run once daily (e.g. via Synology Task Scheduler at 06:00).
 Only articles from the last 7 days are included.
+For each recent article the full text is fetched from the detail page.
 """
 import urllib.request
 import re
@@ -24,14 +24,41 @@ def fetch(url):
         headers={"User-Agent": "Mozilla/5.0 (compatible; NachrichtenWennigsen/1.0)"},
     )
     with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read().decode("utf-8")
+        return r.read().decode("utf-8", errors="replace")
+
+
+def fetch_full_text(url):
+    """Fetch full article text from the detail page."""
+    try:
+        html = fetch(url)
+        m = re.search(
+            r'itemprop="articleBody">(.*?)</div>\s*</div>\s*</div>',
+            html,
+            re.DOTALL,
+        )
+        if not m:
+            return ""
+        body = m.group(1)
+        paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', body, re.DOTALL)
+        texts = []
+        for p in paragraphs:
+            text = re.sub(r'<[^>]+>', '', p)
+            text = (text
+                    .replace('&nbsp;', ' ')
+                    .replace('&amp;', '&')
+                    .replace('&lt;', '<')
+                    .replace('&gt;', '>'))
+            text = re.sub(r'\s+', ' ', text).strip()
+            if text:
+                texts.append(text)
+        return '\n\n'.join(texts)
+    except Exception:
+        return ""
 
 
 def parse_articles(html):
     articles = []
 
-    # Each article lives inside a <div class="teaser-text"> block.
-    # We grab the block up to the closing </div> of the ortsmarke div or the mehr-link.
     blocks = re.findall(
         r'<div[^>]+class="teaser-text"[^>]*>(.*?)</div>\s*</div>\s*</div>',
         html,
@@ -39,10 +66,9 @@ def parse_articles(html):
     )
 
     for block in blocks:
-        # --- date (prefer machine-readable datetime attribute) ---
+        # --- date ---
         date_m = re.search(r'<time[^>]+datetime="(\d{4}-\d{2}-\d{2})"', block)
         if not date_m:
-            # fallback: visible text DD.MM.YYYY
             date_m = re.search(r'<time[^>]*>\s*(\d{2}\.\d{2}\.\d{4})\s*</time>', block)
             if not date_m:
                 continue
@@ -70,18 +96,7 @@ def parse_articles(html):
         title = re.sub(r"\s+", " ", title).strip()
         link  = BASE_URL + href
 
-        # --- teaser description (inside div.ortsmarke[itemprop=description]) ---
-        desc_m = re.search(
-            r'<div[^>]+itemprop="description"[^>]*>(.*?)</div>',
-            block,
-            re.DOTALL,
-        )
-        desc = ""
-        if desc_m:
-            desc = re.sub(r"<[^>]+>", "", desc_m.group(1))
-            desc = re.sub(r"\s+", " ", desc).strip()
-
-        articles.append({"title": title, "link": link, "date": pub_date, "desc": desc})
+        articles.append({"title": title, "link": link, "date": pub_date, "desc": ""})
 
     return articles
 
@@ -139,7 +154,13 @@ def main():
         html     = fetch(SOURCE_URL)
         articles = parse_articles(html)
         recent   = filter_recent(articles)
-        rss      = build_rss(recent)
+
+        # Fetch full text only for recent articles (minimises HTTP requests)
+        for a in recent:
+            a["desc"] = fetch_full_text(a["link"])
+            print(f"  [{a['date'].strftime('%d.%m.%Y')}] {a['title'][:60]}")
+
+        rss = build_rss(recent)
 
         with open(OUTPUT_FILE, "w", encoding="utf-8") as fh:
             fh.write(rss)
