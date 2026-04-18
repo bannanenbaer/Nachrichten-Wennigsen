@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
 Scrapes con-nect.de/wennigsen and writes an RSS feed to feed.xml.
-Only articles from the last 7 days are included.
 
-Full article text is fetched from the detail page exactly once per article
-and cached locally in cache.json. Entries expire automatically after 7 days.
+Two-phase strategy:
+  Phase 1 (fast): write feed.xml immediately with teaser text for new articles
+                  and full text for already-cached articles.
+  Phase 2 (background): fetch full text for new articles one by one,
+                  update cache.json and rewrite feed.xml after each fetch.
+
+This keeps startup fast even when many new articles appear.
 """
 import urllib.request
 import re
 import datetime
 import os
 import json
+import threading
 from email.utils import formatdate
 import calendar
 import sys
@@ -21,6 +26,8 @@ DIR         = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_FILE = os.path.join(DIR, "feed.xml")
 CACHE_FILE  = os.path.join(DIR, "cache.json")
 DAYS_BACK   = 7
+
+_write_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +47,6 @@ def save_cache(cache):
 
 
 def expire_cache(cache):
-    """Remove entries older than DAYS_BACK days."""
     cutoff = (datetime.datetime.now() - datetime.timedelta(days=DAYS_BACK)).strftime("%Y-%m-%d")
     return {url: data for url, data in cache.items() if data.get("date", "") >= cutoff}
 
@@ -59,7 +65,6 @@ def fetch(url):
 
 
 def fetch_full_text(url):
-    """Fetch full article text from the detail page."""
     try:
         html = fetch(url)
         m = re.search(
@@ -101,6 +106,7 @@ def parse_articles(html):
     )
 
     for block in blocks:
+        # date
         date_m = re.search(r'<time[^>]+datetime="(\d{4}-\d{2}-\d{2})"', block)
         if not date_m:
             date_m = re.search(r'<time[^>]*>\s*(\d{2}\.\d{2}\.\d{4})\s*</time>', block)
@@ -116,6 +122,7 @@ def parse_articles(html):
             except ValueError:
                 continue
 
+        # link + title
         link_m = re.search(
             r'<a[^>]+href="(/wennigsen/[^"]+)"[^>]*>.*?'
             r'<span[^>]*itemprop="headline"[^>]*>(.*?)</span>',
@@ -129,7 +136,19 @@ def parse_articles(html):
         title = re.sub(r"\s+", " ", title).strip()
         link  = BASE_URL + href
 
-        articles.append({"title": title, "link": link, "date": pub_date, "desc": ""})
+        # teaser text (short, from list page — used as placeholder until full text is cached)
+        teaser = ""
+        teaser_m = re.search(r'<div[^>]+itemprop="description"[^>]*>(.*?)</div>', block, re.DOTALL)
+        if teaser_m:
+            teaser = re.sub(r"<[^>]+>", "", teaser_m.group(1))
+            teaser = re.sub(r"\s+", " ", teaser).strip()
+
+        articles.append({
+            "title":  title,
+            "link":   link,
+            "date":   pub_date,
+            "desc":   teaser,   # placeholder; replaced by full text once cached
+        })
 
     return articles
 
@@ -186,46 +205,85 @@ def build_rss(articles):
     )
 
 
+def _write_feed(recent):
+    rss = build_rss(recent)
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as fh:
+        fh.write(rss)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
+def main(background=False):
+    """
+    background=True  → full-text fetches run in a daemon thread (used by Flask/APScheduler)
+    background=False → wait for all fetches before returning (used on command line)
+    """
     try:
-        cache   = load_cache()
-        cache   = expire_cache(cache)
+        cache  = load_cache()
+        cache  = expire_cache(cache)
 
         html     = fetch(SOURCE_URL)
         articles = parse_articles(html)
         recent   = filter_recent(articles)
 
-        fetched = 0
+        new_articles = []
         for a in recent:
-            url = a["link"]
-            if url in cache:
-                a["desc"] = cache[url]["desc"]
-                print(f"  [cache] [{a['date'].strftime('%d.%m.%Y')}] {a['title'][:55]}")
+            if a["link"] in cache:
+                a["desc"] = cache[a["link"]]["desc"]
             else:
-                a["desc"] = fetch_full_text(url)
-                cache[url] = {"date": a["date"].strftime("%Y-%m-%d"), "desc": a["desc"]}
-                fetched += 1
-                print(f"  [neu]   [{a['date'].strftime('%d.%m.%Y')}] {a['title'][:55]}")
+                # desc already set to teaser from parse_articles
+                new_articles.append(a)
 
-        save_cache(cache)
+        # Phase 1: write feed immediately (teasers for new, full text for cached)
+        with _write_lock:
+            _write_feed(recent)
 
-        rss = build_rss(recent)
-        with open(OUTPUT_FILE, "w", encoding="utf-8") as fh:
-            fh.write(rss)
+        cached_count = len(recent) - len(new_articles)
+        if new_articles:
+            print(
+                f"[{datetime.datetime.now():%Y-%m-%d %H:%M}] "
+                f"Phase 1 fertig – {len(recent)} Artikel "
+                f"({cached_count} aus Cache, {len(new_articles)} neu mit Teaser)"
+            )
+        else:
+            print(
+                f"[{datetime.datetime.now():%Y-%m-%d %H:%M}] "
+                f"OK – {len(recent)} Artikel (alle aus Cache)"
+            )
+            save_cache(cache)
+            return
 
-        print(
-            f"[{datetime.datetime.now():%Y-%m-%d %H:%M}] "
-            f"OK – {len(recent)} Artikel ({fetched} neu abgerufen, "
-            f"{len(recent) - fetched} aus Cache)"
-        )
+        # Phase 2: fetch full texts in background
+        def fetch_all():
+            for a in new_articles:
+                full = fetch_full_text(a["link"])
+                a["desc"] = full
+                with _write_lock:
+                    cache[a["link"]] = {
+                        "date": a["date"].strftime("%Y-%m-%d"),
+                        "desc": full,
+                    }
+                    save_cache(cache)
+                    _write_feed(recent)
+                print(
+                    f"  [fertig] [{a['date'].strftime('%d.%m.%Y')}] {a['title'][:55]}"
+                )
+            print(
+                f"[{datetime.datetime.now():%Y-%m-%d %H:%M}] "
+                f"Phase 2 fertig – {len(new_articles)} Volltexte gecacht"
+            )
+
+        t = threading.Thread(target=fetch_all, daemon=True)
+        t.start()
+        if not background:
+            t.join()
+
     except Exception as exc:
         print(f"[{datetime.datetime.now():%Y-%m-%d %H:%M}] FEHLER: {exc}", file=sys.stderr)
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    main(background=False)

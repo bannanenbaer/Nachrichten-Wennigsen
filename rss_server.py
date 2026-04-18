@@ -10,15 +10,15 @@ app = Flask(__name__)
 
 FEED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feed.xml")
 
-# Initial scrape on startup so feed.xml exists immediately
+# Initial scrape on startup — Phase 1 (teaser) blocks briefly, Phase 2 (Volltext) läuft im Hintergrund
 try:
-    scraper.main()
+    scraper.main(background=True)
 except Exception as exc:
     print(f"[startup] Scraper fehlgeschlagen: {exc}")
 
-# Daily 06:00 refresh
+# Daily 06:00 refresh — ebenfalls non-blocking
 _scheduler = BackgroundScheduler(daemon=True)
-_scheduler.add_job(scraper.main, "cron", hour=6, minute=0)
+_scheduler.add_job(scraper.main, "cron", hour=6, minute=0, kwargs={"background": True})
 _scheduler.start()
 atexit.register(_scheduler.shutdown)
 
@@ -28,7 +28,7 @@ atexit.register(_scheduler.shutdown)
 def feed():
     if not os.path.exists(FEED_FILE):
         try:
-            scraper.main()
+            scraper.main(background=True)
         except Exception as exc:
             return f"Feed nicht verfügbar: {exc}", 503
     resp = make_response(send_file(FEED_FILE, mimetype="application/rss+xml"))
