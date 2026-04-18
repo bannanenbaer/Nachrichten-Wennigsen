@@ -24,6 +24,7 @@ atexit.register(_scheduler.shutdown)
 
 
 @app.route("/feed.xml")
+@app.route("/feed.rss")
 def feed():
     if not os.path.exists(FEED_FILE):
         try:
