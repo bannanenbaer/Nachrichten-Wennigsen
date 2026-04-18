@@ -1,0 +1,13 @@
+services:
+  nachrichten:
+    image: ghcr.io/bannanenbaer/nachrichten-rss-feed:latest
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "8003:5000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.create_connection(('localhost',5000),3); s.close()"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

@@ -3,14 +3,13 @@
 Minimal HTTP server that serves feed.xml with strict no-cache headers
 so FritzFon always reads fresh data from the server instead of its own cache.
 
-Default port: 8088  (change PORT below or pass as first argument)
-Start automatically on boot via Synology Task Scheduler (triggered task).
+Port: env PORT (default 5000 for Docker; pass as first argument to override).
 """
 import http.server
 import os
 import sys
 
-PORT     = int(sys.argv[1]) if len(sys.argv) > 1 else 8088
+PORT = int(os.environ.get("PORT", sys.argv[1] if len(sys.argv) > 1 else 5000))
 SERVE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
